@@ -1,0 +1,133 @@
+import cv2
+import numpy as np
+
+def enhance_faint_strokes(img_path):
+    img = cv2.imread(img_path)
+    if img is None:
+        print("Error: Could not load image")
+        return None, None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    scale_factor = min(gray.shape) / 1000
+    h = int(10 * scale_factor)
+    tsize = int(7 * scale_factor) | 1
+    ssize = int(21 * scale_factor) | 1
+    denoised = cv2.fastNlMeansDenoising(gray, None, h=h, templateWindowSize=tsize, searchWindowSize=ssize)
+    inverted = 255 - denoised
+    gamma = 0.9
+    brightened = np.power(inverted / 255.0, gamma) * 255
+    brightened = np.clip(brightened, 0, 255).astype(np.uint8)
+    strokes_darkened = 255 - brightened
+    min_val = np.percentile(strokes_darkened, 2)
+    max_val = np.percentile(strokes_darkened, 98)
+    contrast_stretched = np.clip((strokes_darkened - min_val) * 255.0 / (max_val - min_val + 1e-5), 0, 255).astype(np.uint8)
+    return contrast_stretched, img
+
+def detect_table_cells(cropped_img):
+    height, width = cropped_img.shape
+
+    horizontal_kernel_length = max(10, width // 40)
+    vertical_kernel_length = max(10, height // 40)
+
+    binary = cv2.adaptiveThreshold(cropped_img, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 15, 5)
+
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_kernel_length, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_kernel_length))
+
+    detect_horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    detect_vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+
+    grid = cv2.addWeighted(detect_horizontal, 0.5, detect_vertical, 0.5, 0.0)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    grid = cv2.dilate(grid, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        aspect_ratio = h / (w + 1e-5)
+        height_ratio = h / height
+
+        if aspect_ratio > 10 and height_ratio > 0.9:
+            continue
+
+        if 0.02 * width < w < 0.9 * width and 0.02 * height < h < 0.5 * height:
+            boxes.append((x, y, w, h))
+
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    return boxes
+
+def find_main_rectangles(img_path):
+    enhanced, original_img = enhance_faint_strokes(img_path)
+    if enhanced is None:
+        return None
+    blurred = cv2.GaussianBlur(enhanced, (1, 1), 0)
+    h, w = blurred.shape
+    block_size = max(11, min(51, (min(h, w) // 100) | 1))
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, block_size, 7)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(255 - morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    img_area = h * w
+    candidates = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 0.01 * img_area or area > 0.95 * img_area:
+            continue
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)
+        box = np.intp(box)
+        w_box = np.linalg.norm(box[0] - box[1])
+        h_box = np.linalg.norm(box[1] - box[2])
+        aspect_ratio = max(w_box, h_box) / (min(w_box, h_box) + 1e-5)
+        if aspect_ratio > 10 or aspect_ratio < 0.1:
+            continue
+        candidates.append((area, box))
+    candidates.sort(key=lambda x: -x[0])
+    top_2 = candidates[:2]
+    output = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    all_cells = []
+    for _, box in top_2:
+        cv2.drawContours(output, [box], 0, (0, 0, 255), 2)
+
+        rect = cv2.minAreaRect(box)
+        center, size, angle = rect
+        if angle < -45:
+            angle += 90
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(enhanced, M, (enhanced.shape[1], enhanced.shape[0]))
+
+        warped_box = cv2.transform(np.array([box]), M)[0]
+        x, y, w, h = cv2.boundingRect(warped_box)
+        cropped = rotated[y:y + h, x:x + w]
+
+        cell_boxes = detect_table_cells(cropped)
+
+        for (cx, cy, cw, ch) in cell_boxes:
+            pt1 = (cx + x, cy + y)
+            pt2 = (cx + x + cw, cy + y + ch)
+            cv2.rectangle(output, pt1, pt2, (0, 255, 0), 1)
+            all_cells.append((pt1[0], pt1[1], cw, ch))
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        screen_width = user32.GetSystemMetrics(0)
+        screen_height = user32.GetSystemMetrics(1)
+    except:
+        screen_width = 1366
+        screen_height = 768
+    scale = min(0.9, (screen_width - 100) / w, (screen_height - 100) / h)
+    resized = cv2.resize(output, (int(w * scale), int(h * scale)))
+    cv2.imshow('Detected Rectangles', resized)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    return output
+
+
+result = find_main_rectangles(
+    r"C:\Users\kathe\Downloads\ilovepdf_images-extracted\img19.jpg")
+if result is not None:
+    cv2.imwrite('enhanced_result.jpg', result)
